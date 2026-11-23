@@ -61,3 +61,5 @@ try:
 except Exception:
     print('?')")
           echo "::notice::token 有效，目标 app = $NAME"
+
+# reindex trigger
