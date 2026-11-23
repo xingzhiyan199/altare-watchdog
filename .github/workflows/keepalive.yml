@@ -1,0 +1,31 @@
+name: Keepalive
+
+# GitHub 会在仓库连续 60 天无提交活动后自动停用 scheduled workflow。
+# 这个任务每月 1 号写一行时间戳，避免看门狗被静默关掉。
+
+on:
+  schedule:
+    - cron: "0 3 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  touch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 更新时间戳
+        run: |
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .keepalive
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .keepalive
+          if git diff --cached --quiet; then
+            echo "无变化"
+          else
+            git commit -m "chore: keepalive $(date -u +%Y-%m)"
+            git push
+          fi

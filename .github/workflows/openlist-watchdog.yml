@@ -1,0 +1,120 @@
+name: OpenList Watchdog
+
+# 每 5 分钟探活一次；挂了就调 Altare API 强制拉起，拉不起来再 restart 一次。
+# 注意：GitHub 的 schedule 不保证准点，实际触发会有 3~15 分钟抖动。
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openlist-watchdog
+  cancel-in-progress: false
+
+env:
+  HEALTH_URL: https://openlist.go.altare.global/ping
+  API_BASE: https://console.altare.gg/api
+  TENANT_ID: 78b0fb5e-e781-48d5-9664-1c365b5bb7f7
+  SERVER_ID: 79f32fd0-3af2-4174-bc75-8fc88322a6e3
+  UA: "Mozilla/5.0 (compatible; OpenListWatchdog/1.0)"
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
+
+    steps:
+      - name: 1) 探活（3 次重试，单次抖动不算挂）
+        id: probe
+        run: |
+          set -u
+          ok=0
+          for i in 1 2 3; do
+            raw=$(curl -sS -m 20 -A "$UA" -w '\n%{http_code}' "$HEALTH_URL" 2>/dev/null || printf '\n000')
+            code=$(printf '%s' "$raw" | tail -n1)
+            text=$(printf '%s' "$raw" | sed '$d' | tr -d '\r\n' | head -c 40)
+            echo "第 $i 次: http=$code body=${text:-<empty>}"
+            if [ "$code" = "200" ] && [ "$text" = "pong" ]; then ok=1; break; fi
+            if [ "$i" -lt 3 ]; then sleep 10; fi
+          done
+          if [ "$ok" = "1" ]; then
+            echo "healthy=true"  >> "$GITHUB_OUTPUT"
+            echo "::notice::OpenList 正常"
+          else
+            echo "healthy=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::OpenList 无响应，进入恢复流程"
+          fi
+
+      - name: 2) 拉起（power start）
+        if: steps.probe.outputs.healthy == 'false'
+        env:
+          ALTARE_TOKEN: ${{ secrets.ALTARE_TOKEN }}
+        run: |
+          set -u
+          if [ -z "${ALTARE_TOKEN:-}" ]; then
+            echo "::error::secrets.ALTARE_TOKEN 未配置，无法调用 Altare API"
+            exit 1
+          fi
+
+          power() {
+            local sig="$1" raw code
+            raw=$(curl -sS -m 30 -X POST \
+              "$API_BASE/tenants/$TENANT_ID/servers/$SERVER_ID/power" \
+              -H "Authorization: Bearer $ALTARE_TOKEN" \
+              -H "Content-Type: application/json" \
+              -H "User-Agent: $UA" \
+              -d "{\"signal\":\"$sig\"}" \
+              -w '\n%{http_code}' 2>&1) || true
+            code=$(printf '%s' "$raw" | tail -n1)
+            echo "power $sig -> http=$code $(printf '%s' "$raw" | sed '$d' | head -c 200)"
+            [ "$code" = "200" ] || [ "$code" = "204" ]
+          }
+
+          if power start; then
+            echo "::notice::已发送 start 指令"
+          else
+            echo "::warning::start 指令返回异常，继续观察"
+          fi
+
+          for i in $(seq 1 15); do
+            sleep 10
+            raw=$(curl -sS -m 15 -A "$UA" -w '\n%{http_code}' "$HEALTH_URL" 2>/dev/null || printf '\n000')
+            code=$(printf '%s' "$raw" | tail -n1)
+            text=$(printf '%s' "$raw" | sed '$d' | tr -d '\r\n' | head -c 40)
+            echo "等待 $((i*10))s: http=$code body=${text:-<empty>}"
+            if [ "$code" = "200" ] && [ "$text" = "pong" ]; then
+              echo "::notice::OpenList 已恢复，耗时约 $((i*10)) 秒"
+              exit 0
+            fi
+          done
+
+          echo "::warning::start 后 150 秒仍未恢复，尝试 restart"
+          power restart || true
+
+          for i in $(seq 1 9); do
+            sleep 10
+            code=$(curl -sS -m 15 -A "$UA" -o /dev/null -w '%{http_code}' "$HEALTH_URL" 2>/dev/null || echo 000)
+            echo "restart 后 $((i*10))s: http=$code"
+            if [ "$code" = "200" ]; then
+              echo "::notice::restart 后已恢复"
+              exit 0
+            fi
+          done
+
+          echo "::error::OpenList 无法自动恢复，需要人工介入（可能是节点或额度问题）"
+          exit 1
+
+      - name: 3) 汇总
+        if: always()
+        run: |
+          {
+            echo "### OpenList Watchdog"
+            echo ""
+            echo "- 探活结果：\`${{ steps.probe.outputs.healthy }}\`"
+            echo "- 触发时间：$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "- 目标：$HEALTH_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
