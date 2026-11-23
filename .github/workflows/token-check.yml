@@ -1,0 +1,63 @@
+name: Token Check
+
+# 每天校验一次 ALTARE_TOKEN 是否仍然有效。
+# 目的是提前发现 secret 过期/被撤销——否则要等到真出事那天，
+# 看门狗才发现自己手里是张废牌。
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  API_BASE: https://console.altare.gg/api
+  TENANT_ID: 78b0fb5e-e781-48d5-9664-1c365b5bb7f7
+  SERVER_ID: 79f32fd0-3af2-4174-bc75-8fc88322a6e3
+  UA: "Mozilla/5.0 (compatible; OpenListWatchdog/1.0)"
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: 校验 token 能读到 server
+        env:
+          ALTARE_TOKEN: ${{ secrets.ALTARE_TOKEN }}
+        run: |
+          set -u
+          if [ -z "${ALTARE_TOKEN:-}" ]; then
+            echo "::error::secrets.ALTARE_TOKEN 未配置"
+            exit 1
+          fi
+
+          RAW=$(curl -sS -m 25 \
+            -H "Authorization: Bearer $ALTARE_TOKEN" \
+            -H "User-Agent: $UA" \
+            -w '\n%{http_code}' \
+            "$API_BASE/tenants/$TENANT_ID/servers/$SERVER_ID/details" 2>&1) || true
+          CODE=$(printf '%s' "$RAW" | tail -n1)
+          BODY=$(printf '%s' "$RAW" | sed '$d')
+
+          echo "details -> http=$CODE"
+          echo "$BODY" | head -c 400
+
+          if [ "$CODE" = "401" ] || [ "$CODE" = "403" ]; then
+            echo "::error::ALTARE_TOKEN 失效（http=$CODE），请重新生成并更新 secret"
+            exit 1
+          fi
+          if [ "$CODE" != "200" ]; then
+            echo "::warning::非预期状态 http=$CODE，可能是平台侧临时故障"
+            exit 1
+          fi
+
+          NAME=$(printf '%s' "$BODY" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get('name', '?'), d.get('sandbox'), d.get('imageApp'))
+except Exception:
+    print('?')")
+          echo "::notice::token 有效，目标 app = $NAME"
