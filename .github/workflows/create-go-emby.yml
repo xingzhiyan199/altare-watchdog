@@ -46,17 +46,22 @@ jobs:
           altr --help > /dev/null
           echo "altr 就绪 $(altr --version 2>/dev/null || true)"
 
-      - name: 2) 检查是否已存在 go-emby
+      - name: 2) 连通性诊断 + 检查现有实例
         id: check
         env:
           TK: ${{ secrets.ALTARE_TOKEN_B }}
+        continue-on-error: true
         run: |
-          set -uo pipefail
-          r=$(curl -sS -m 40 -H "Authorization: Bearer $TK" "$API/tenants/$TENANT/servers" || echo '{}')
-          sid=$(printf '%s' "$r" | jq -r --arg n "$APP" '.items[]? | select(.name==$n) | .id' 2>/dev/null | head -1)
-          [ "$sid" = "null" ] && sid=""
-          echo "已存在实例: ${sid:-无}"
-          echo "sid=$sid" >> "$GITHUB_OUTPUT"
+          echo "--- 连通性 ---"
+          curl -sS -m 40 -o /dev/null -w "plans http=%{http_code} time=%{time_total}s\n" https://console.altare.gg/api/plans || echo "curl 失败 exit=$?"
+          echo "--- 实例列表 ---"
+          R=$(curl -sS -m 40 -H "Authorization: Bearer $TK" "https://console.altare.gg/api/tenants/$TENANT/servers" 2>/dev/null || true)
+          echo "响应长度=${#R}"
+          printf '%s' "$R" | head -c 400; echo ""
+          SID=$(printf '%s' "$R" | jq -r '.items[]? | select(.name=="go-emby") | .id' 2>/dev/null | head -1 || true)
+          if [ "$SID" = "null" ]; then SID=""; fi
+          echo "sid=[$SID]"
+          echo "sid=$SID" >> "$GITHUB_OUTPUT"
 
       - name: 3) 抢机位（最长 5 小时）
         if: steps.check.outputs.sid == ''
@@ -64,6 +69,7 @@ jobs:
           TK: ${{ secrets.ALTARE_TOKEN_B }}
         run: |
           set -uo pipefail
+          set +e   # Actions 默认 bash -e，会误杀 [ ] && 短路
           LOCS="sg-sgp jp-tyo th-bkk id-jkt in-mum us-lax us-pdx us-iad fi-hel kg-bsz mn-uln se-sto se-kna au-bne de-fra"
           # 内存保 3072（PG+go-emby 低于 2G 会 OOM），先降磁盘去塞节点碎片，最后才降内存
           SPECS="3072:4096:60 3072:3584:60 3072:3072:60 2560:3072:50 2048:3072:40"
@@ -149,6 +155,7 @@ jobs:
         if: steps.check.outputs.sid != '' || env.LOCATED != ''
         run: |
           set -uo pipefail
+          set +e   # Actions 默认 bash -e，会误杀 [ ] && 短路
           # 首次启动要 initdb，慢盘上崩溃恢复更久，给 30 分钟
           for i in $(seq 1 90); do
             c1=$(curl -s -o /dev/null -m 15 -w '%{http_code}' "$HEALTH/health" 2>/dev/null || echo 000)
@@ -164,6 +171,7 @@ jobs:
       - name: 5) 建库
         run: |
           set -uo pipefail
+          set +e   # Actions 默认 bash -e，会误杀 [ ] && 短路
           JAR=/tmp/ck.txt; rm -f "$JAR"
           TOK=""
           login() {
