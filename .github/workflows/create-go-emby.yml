@@ -37,7 +37,9 @@ jobs:
       - name: 1) 安装 altr
         run: |
           set -euo pipefail
-          curl -fsSL -o /tmp/altr https://altare.gg/downloads/altr/0.8.1/altr-linux-amd64
+          # altare.gg 会按 UA 拦 curl（403），必须伪装成浏览器
+          UA="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          curl -fsSL -A "$UA" -o /tmp/altr https://altare.gg/downloads/altr/0.8.1/altr-linux-amd64
           echo "0e49491a01d6d9295ddb545b0396b02ae513f99174a65d536a64558b681818b4  /tmp/altr" | sha256sum -c -
           chmod +x /tmp/altr
           sudo install -m 755 /tmp/altr /usr/local/bin/altr
