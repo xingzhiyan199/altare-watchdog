@@ -37,10 +37,12 @@ jobs:
       - name: 1) 安装 altr
         run: |
           set -euo pipefail
-          curl -fsSL -o /usr/local/bin/altr https://altare.gg/downloads/altr/0.8.1/altr-linux-amd64
-          chmod +x /usr/local/bin/altr
+          curl -fsSL -o /tmp/altr https://altare.gg/downloads/altr/0.8.1/altr-linux-amd64
+          echo "0e49491a01d6d9295ddb545b0396b02ae513f99174a65d536a64558b681818b4  /tmp/altr" | sha256sum -c -
+          chmod +x /tmp/altr
+          sudo install -m 755 /tmp/altr /usr/local/bin/altr
           altr --help > /dev/null
-          echo "altr 就绪"
+          echo "altr 就绪 $(altr --version 2>/dev/null || true)"
 
       - name: 2) 检查是否已存在 go-emby
         id: check
