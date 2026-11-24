@@ -30,7 +30,7 @@ env:
 jobs:
   watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 9
+    timeout-minutes: 15
 
     steps:
       - name: 1) 探活（3 次重试，单次抖动不算挂）
@@ -76,7 +76,7 @@ jobs:
           }
 
           power() {
-            local sig="$1" raw code
+            local sig="$1" raw code body
             raw=$(curl -sS -m 30 -X POST \
               "$API_BASE/tenants/$TENANT_ID/servers/$SERVER_ID/power" \
               -H "Authorization: Bearer $ALTARE_TOKEN" \
@@ -85,8 +85,10 @@ jobs:
               -d "{\"signal\":\"$sig\"}" \
               -w '\n%{http_code}' 2>&1) || true
             code=$(printf '%s' "$raw" | tail -n1)
-            echo "power $sig -> http=$code $(printf '%s' "$raw" | sed '$d' | head -c 200)"
-            [ "$code" = "200" ] || [ "$code" = "204" ]
+            body=$(printf '%s' "$raw" | sed '$d' | head -c 300)
+            echo "power $sig -> http=$code $body"
+            # 202 = 已入队（节点繁忙时会这样返回，body 里有 position/reason）
+            [ "$code" = "200" ] || [ "$code" = "202" ] || [ "$code" = "204" ]
           }
 
           if power start; then
@@ -95,7 +97,9 @@ jobs:
             echo "::warning::start 指令返回异常，继续观察"
           fi
 
-          for i in $(seq 1 15); do
+          # 节点繁忙时 start 只是入队，排队可能要几分钟，这里给足 8 分钟窗口。
+          # 重复发 start 会让队列更堵，所以等待期间不再重发。
+          for i in $(seq 1 48); do
             sleep 10
             echo -n "等待 $((i*10))s: "
             if healthy; then
@@ -104,10 +108,10 @@ jobs:
             fi
           done
 
-          echo "::warning::start 后 150 秒仍未恢复，尝试 restart"
+          echo "::warning::start 后 480 秒仍未恢复，尝试 restart"
           power restart || true
 
-          for i in $(seq 1 9); do
+          for i in $(seq 1 18); do
             sleep 10
             echo -n "restart 后 $((i*10))s: "
             if healthy; then
