@@ -1,0 +1,123 @@
+name: OpenList-B Watchdog (openlist-dup4)
+
+# B 账号（cs64361410@gmail.com）的 OpenList 外部探活 + 自动拉起。
+# 与 A 账号的 openlist-watchdog.yml 逻辑一致，只是目标/密钥不同：
+#   - 探活 https://openlist-dup4.go.altare.global/ping  （期望 200 + pong）
+#   - 连续 3 次失败 → power start → 150s 内没回来 → power restart → 90s 再判
+# 注意：GitHub schedule 不保证准点，实际触发有 3~15 分钟抖动。
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openlist-b-watchdog
+  cancel-in-progress: false
+
+env:
+  HEALTH_URL: https://openlist-dup4.go.altare.global/ping
+  API_BASE: https://console.altare.gg/api
+  TENANT_ID: 6dbafa5a-1313-4686-8a18-4f8777d02ce5
+  SERVER_ID: 1f72a1e6-b8b7-405b-b5e3-623a56f1cd2c
+  UA: "Mozilla/5.0 (compatible; OpenListWatchdog/1.1)"
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
+
+    steps:
+      - name: 1) 探活（3 次重试，单次抖动不算挂）
+        id: probe
+        run: |
+          set -u
+          ok=0
+          for i in 1 2 3; do
+            raw=$(curl -sS -m 20 -A "$UA" -w '\n%{http_code}' "$HEALTH_URL" 2>/dev/null || printf '\n000')
+            code=$(printf '%s' "$raw" | tail -n1)
+            text=$(printf '%s' "$raw" | sed '$d' | tr -d '\r\n' | head -c 40)
+            echo "第 $i 次: http=$code body=${text:-<empty>}"
+            if [ "$code" = "200" ] && [ "$text" = "pong" ]; then ok=1; break; fi
+            if [ "$i" -lt 3 ]; then sleep 10; fi
+          done
+          if [ "$ok" = "1" ]; then
+            echo "healthy=true"  >> "$GITHUB_OUTPUT"
+            echo "::notice::OpenList-B 正常"
+          else
+            echo "healthy=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::OpenList-B 无响应，进入恢复流程"
+          fi
+
+      - name: 2) 拉起（power start → restart）
+        if: steps.probe.outputs.healthy == 'false'
+        env:
+          ALTARE_TOKEN: ${{ secrets.ALTARE_TOKEN_B }}
+        run: |
+          set -u
+          if [ -z "${ALTARE_TOKEN:-}" ]; then
+            echo "::error::secrets.ALTARE_TOKEN_B 未配置，无法调用 Altare API"
+            exit 1
+          fi
+
+          power() {
+            local sig="$1" raw code
+            raw=$(curl -sS -m 30 -X POST \
+              "$API_BASE/tenants/$TENANT_ID/servers/$SERVER_ID/power" \
+              -H "Authorization: Bearer $ALTARE_TOKEN" \
+              -H "Content-Type: application/json" \
+              -H "User-Agent: $UA" \
+              -d "{\"signal\":\"$sig\"}" \
+              -w '\n%{http_code}' 2>&1) || true
+            code=$(printf '%s' "$raw" | tail -n1)
+            echo "power $sig -> http=$code $(printf '%s' "$raw" | sed '$d' | head -c 200)"
+            [ "$code" = "200" ] || [ "$code" = "204" ]
+          }
+
+          if power start; then
+            echo "::notice::已发送 start 指令"
+          else
+            echo "::warning::start 指令返回异常，继续观察"
+          fi
+
+          for i in $(seq 1 15); do
+            sleep 10
+            raw=$(curl -sS -m 15 -A "$UA" -w '\n%{http_code}' "$HEALTH_URL" 2>/dev/null || printf '\n000')
+            code=$(printf '%s' "$raw" | tail -n1)
+            text=$(printf '%s' "$raw" | sed '$d' | tr -d '\r\n' | head -c 40)
+            echo "等待 $((i*10))s: http=$code body=${text:-<empty>}"
+            if [ "$code" = "200" ] && [ "$text" = "pong" ]; then
+              echo "::notice::OpenList-B 已恢复，耗时约 $((i*10)) 秒"
+              exit 0
+            fi
+          done
+
+          echo "::warning::start 后 150 秒仍未恢复，尝试 restart"
+          power restart || true
+
+          for i in $(seq 1 9); do
+            sleep 10
+            code=$(curl -sS -m 15 -A "$UA" -o /dev/null -w '%{http_code}' "$HEALTH_URL" 2>/dev/null || echo 000)
+            echo "restart 后 $((i*10))s: http=$code"
+            if [ "$code" = "200" ]; then
+              echo "::notice::restart 后已恢复"
+              exit 0
+            fi
+          done
+
+          echo "::error::OpenList-B 无法自动恢复，需要人工介入（可能是节点或额度问题）"
+          exit 1
+
+      - name: 3) 汇总
+        if: always()
+        run: |
+          {
+            echo "### OpenList-B Watchdog"
+            echo ""
+            echo "- 探活结果：\`${{ steps.probe.outputs.healthy }}\`"
+            echo "- 触发时间：$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "- 目标：$HEALTH_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
