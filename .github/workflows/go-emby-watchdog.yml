@@ -1,0 +1,131 @@
+name: go-emby Watchdog (2fc99808)
+
+# B 账号（cs64361410@gmail.com）的 go-emby 外部探活 + 自动拉起。
+# 与 openlist-b-watchdog.yml 同一套逻辑，只是探活端点和目标应用不同：
+#   - 探活 https://go-emby.go.altare.global/System/Info/Public（期望 200 + 合法 JSON）
+#   - 连续 3 次失败 → power start → 150s 内没回来 → power restart → 90s 再判
+# 注意：GitHub schedule 不保证准点，实际触发有 3~15 分钟抖动。
+# 说明：容器内是 PG + go-emby + strm 三合一，go-emby 进程挂了但 PG 还活着时
+#       容器不会退出，所以必须靠 HTTP 探活而不是看应用状态。
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-emby-watchdog
+  cancel-in-progress: false
+
+env:
+  HEALTH_URL: https://go-emby.go.altare.global/System/Info/Public
+  API_BASE: https://console.altare.gg/api
+  TENANT_ID: 6dbafa5a-1313-4686-8a18-4f8777d02ce5
+  SERVER_ID: 2fc99808-24d1-4eee-b503-b4ab1a3c8b9f
+  UA: "Mozilla/5.0 (compatible; GoEmbyWatchdog/1.1)"
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
+
+    steps:
+      - name: 1) 探活（3 次重试，单次抖动不算挂）
+        id: probe
+        run: |
+          set -u
+          ok=0
+          for i in 1 2 3; do
+            raw=$(curl -sS -m 20 -A "$UA" -w '\n%{http_code}' "$HEALTH_URL" 2>/dev/null || printf '\n000')
+            code=$(printf '%s' "$raw" | tail -n1)
+            body=$(printf '%s' "$raw" | sed '$d' | tr -d '\r\n')
+            echo "第 $i 次: http=$code body=$(printf '%s' "$body" | head -c 90)"
+            # 正常返回形如 {"ServerName":"...","Id":"...","StartupWizardCompleted":true}
+            if [ "$code" = "200" ] && printf '%s' "$body" | grep -q 'StartupWizardCompleted'; then ok=1; break; fi
+            if [ "$i" -lt 3 ]; then sleep 10; fi
+          done
+          if [ "$ok" = "1" ]; then
+            echo "healthy=true"  >> "$GITHUB_OUTPUT"
+            echo "::notice::go-emby 正常"
+          else
+            echo "healthy=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::go-emby 无响应，进入恢复流程"
+          fi
+
+      - name: 2) 拉起（power start → restart）
+        if: steps.probe.outputs.healthy == 'false'
+        env:
+          ALTARE_TOKEN: ${{ secrets.ALTARE_TOKEN_B }}
+        run: |
+          set -u
+          if [ -z "${ALTARE_TOKEN:-}" ]; then
+            echo "::error::secrets.ALTARE_TOKEN_B 未配置，无法调用 Altare API"
+            exit 1
+          fi
+
+          healthy() {
+            local raw code body
+            raw=$(curl -sS -m 20 -A "$UA" -w '\n%{http_code}' "$HEALTH_URL" 2>/dev/null || printf '\n000')
+            code=$(printf '%s' "$raw" | tail -n1)
+            body=$(printf '%s' "$raw" | sed '$d' | tr -d '\r\n')
+            echo "http=$code body=$(printf '%s' "$body" | head -c 70)"
+            [ "$code" = "200" ] && printf '%s' "$body" | grep -q 'StartupWizardCompleted'
+          }
+
+          power() {
+            local sig="$1" raw code
+            raw=$(curl -sS -m 30 -X POST \
+              "$API_BASE/tenants/$TENANT_ID/servers/$SERVER_ID/power" \
+              -H "Authorization: Bearer $ALTARE_TOKEN" \
+              -H "Content-Type: application/json" \
+              -H "User-Agent: $UA" \
+              -d "{\"signal\":\"$sig\"}" \
+              -w '\n%{http_code}' 2>&1) || true
+            code=$(printf '%s' "$raw" | tail -n1)
+            echo "power $sig -> http=$code $(printf '%s' "$raw" | sed '$d' | head -c 200)"
+            [ "$code" = "200" ] || [ "$code" = "204" ]
+          }
+
+          if power start; then
+            echo "::notice::已发送 start 指令"
+          else
+            echo "::warning::start 指令返回异常，继续观察"
+          fi
+
+          for i in $(seq 1 15); do
+            sleep 10
+            echo -n "等待 $((i*10))s: "
+            if healthy; then
+              echo "::notice::go-emby 已恢复，耗时约 $((i*10)) 秒"
+              exit 0
+            fi
+          done
+
+          echo "::warning::start 后 150 秒仍未恢复，尝试 restart"
+          power restart || true
+
+          for i in $(seq 1 9); do
+            sleep 10
+            echo -n "restart 后 $((i*10))s: "
+            if healthy; then
+              echo "::notice::restart 后已恢复"
+              exit 0
+            fi
+          done
+
+          echo "::error::go-emby 无法自动恢复，需要人工介入（可能是节点、额度或镜像问题）"
+          exit 1
+
+      - name: 3) 汇总
+        if: always()
+        run: |
+          {
+            echo "### go-emby Watchdog"
+            echo ""
+            echo "- 探活结果：\`${{ steps.probe.outputs.healthy }}\`"
+            echo "- 触发时间：$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            echo "- 目标：$HEALTH_URL"
+          } >> "$GITHUB_STEP_SUMMARY"
