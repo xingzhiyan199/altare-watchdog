@@ -1,0 +1,205 @@
+name: go-emby Slot Hunter
+
+# 云端常驻抢机位：免费池长期满载，本地脚本会随会话结束而死，放云端才能 7x24 盯。
+# 公开仓库 Actions 免费、无时长配额，单 job 最长 6 小时，用 concurrency 保证不重叠，
+# 每 6 小时一个新的 job 接上，形成近乎连续的抢位。
+#
+# 流程：装 altr → 查是否已有 go-emby → 没有则按规格矩阵低頻扫机房 → 抢到后等就绪 → 建库 → 验证
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-emby-slot-hunter
+  cancel-in-progress: false
+
+env:
+  API: https://console.altare.gg/api
+  TENANT: 6dbafa5a-1313-4686-8a18-4f8777d02ce5
+  IMAGE: ghcr.io/xingzhiyan199/go-emby-allinone:0235af4f9213933cccfa6ea67485a849f10cbe8b
+  APP: go-emby
+  HEALTH: https://go-emby.go.altare.global
+  PW: liu@1314pass
+  LIB_NAME: STRM
+  LIB_PATH: /data/media/strm
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+
+    steps:
+      - name: 1) 安装 altr
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /usr/local/bin/altr https://altare.gg/downloads/altr/0.8.1/altr-linux-amd64
+          chmod +x /usr/local/bin/altr
+          altr --help > /dev/null
+          echo "altr 就绪"
+
+      - name: 2) 检查是否已存在 go-emby
+        id: check
+        env:
+          TK: ${{ secrets.ALTARE_TOKEN_B }}
+        run: |
+          set -uo pipefail
+          r=$(curl -sS -m 40 -H "Authorization: Bearer $TK" "$API/tenants/$TENANT/servers" || echo '{}')
+          sid=$(printf '%s' "$r" | jq -r --arg n "$APP" '.items[]? | select(.name==$n) | .id' 2>/dev/null | head -1)
+          [ "$sid" = "null" ] && sid=""
+          echo "已存在实例: ${sid:-无}"
+          echo "sid=$sid" >> "$GITHUB_OUTPUT"
+
+      - name: 3) 抢机位（最长 5 小时）
+        if: steps.check.outputs.sid == ''
+        env:
+          TK: ${{ secrets.ALTARE_TOKEN_B }}
+        run: |
+          set -uo pipefail
+          LOCS="sg-sgp jp-tyo th-bkk id-jkt in-mum us-lax us-pdx us-iad fi-hel kg-bsz mn-uln se-sto se-kna au-bne de-fra"
+          # 内存保 3072（PG+go-emby 低于 2G 会 OOM），先降磁盘去塞节点碎片，最后才降内存
+          SPECS="3072:4096:60 3072:3584:60 3072:3072:60 2560:3072:50 2048:3072:40"
+          DEADLINE=$(( $(date +%s) + 18000 ))   # 5 小时
+          GLOBAL_COOL=0
+          declare -A COOL
+          ROUND=0
+
+          log() { echo "[$(date -u '+%H:%M:%S')] $*"; }
+
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            ROUND=$((ROUND+1))
+            log "########## 第 $ROUND 轮"
+            for spec in $SPECS; do
+              IFS=':' read -r MEM DISK CPU <<< "$spec"
+              for loc in $LOCS; do
+                NOW=$(date +%s)
+                [ "${COOL[$loc]:-0}" -gt "$NOW" ] && continue
+                if [ "$GLOBAL_COOL" -gt "$NOW" ]; then
+                  W=$(( GLOBAL_COOL - NOW )); [ "$W" -gt 180 ] && W=180
+                  log "429 全局冷却 ${W}s"; sleep "$W"
+                fi
+
+                OUT=$(altr --json --token "$TK" docker create "$APP" "$IMAGE" \
+                  --location "$loc" --memory "$MEM" --disk "$DISK" --cpu "$CPU" --port 8097 \
+                  -e "ADMIN_PASSWORD=$PW" \
+                  -e 'ADMIN_PASSWORD_HASH=$2a$12$.d3CNQyOBz36aLV4x2fo3u0XNEQHOA4k.gRJ3vjBo9IYhsQj9j3YC' \
+                  -e "OL_URL=https://openlist-dup4.go.altare.global" \
+                  -e "OL_USER=admin" -e "OL_PASS=liu@1314" \
+                  -e "STRM_SRC=AUTO" \
+                  -e "STRM_EXCLUDE=/3998/手机图片,/3998/手机视频" \
+                  -e "STRM_DELAY=0.05" -e "STRM_WORKERS=6" \
+                  -e "STRM_PRUNE=1" -e "STRM_FORCE=0" 2>&1 || true)
+                LOW=$(printf '%s' "$OUT" | tr 'A-Z' 'a-z')
+                NOW=$(date +%s)
+
+                if printf '%s' "$OUT" | grep -q '"id"'; then
+                  log ">>> 抢到了！$loc ${MEM}MB/${DISK}MB/${CPU}%"
+                  printf '%s' "$OUT" > /tmp/create_ok.json
+                  echo "$loc" > /tmp/created_loc
+                  echo "LOCATED=$loc" >> "$GITHUB_ENV"
+                  exit 0
+                fi
+
+                case "$LOW" in
+                  *"traffic_busy"*|*"heavy traffic"*)
+                    GLOBAL_COOL=$(( NOW + 90 )); log "$loc ${MEM}MB 429 → 全局退避 90s"; sleep 90 ;;
+                  *"no capacity"*)
+                    COOL[$loc]=$(( NOW + 480 )); log "$loc ${MEM}MB 无空位 → 冷却 8min" ;;
+                  *"deployment limit"*)
+                    COOL[$loc]=$(( NOW + 2400 )); log "$loc ${MEM}MB 节点满额 → 冷却 40min" ;;
+                  *"didn't answer"*|*"didn’t answer"*|*"registry"*)
+                    COOL[$loc]=$(( NOW + 180 )); log "$loc ${MEM}MB 镜像拉取失败 → 冷却 3min" ;;
+                  *"insufficient resources"*)
+                    log "$loc ${MEM}MB 配额不足 → 跳下一档规格"; continue 2 ;;
+                  *"tls"*|*"couldn't reach"*|*"timeout"*|*"eof"*)
+                    COOL[$loc]=$(( NOW + 60 )); log "$loc ${MEM}MB 网络抖动 → 冷却 60s" ;;
+                  *"altare plus"*)
+                    COOL[$loc]=$(( NOW + 999999 )); log "$loc 需要 Plus → 永久跳过" ;;
+                  *)
+                    COOL[$loc]=$(( NOW + 300 )); log "$loc ${MEM}MB 其他 → $(printf '%s' "$OUT" | head -c 100)" ;;
+                esac
+                sleep 6
+              done
+            done
+
+            # 全都在冷却就等最近的解冻点
+            MIN=""
+            for loc in $LOCS; do
+              T=${COOL[$loc]:-0}
+              if [ -z "$MIN" ] || [ "$T" -lt "$MIN" ]; then MIN=$T; fi
+            done
+            NOW=$(date +%s)
+            if [ -n "$MIN" ] && [ "$MIN" -gt "$NOW" ]; then
+              W=$(( MIN - NOW )); [ "$W" -gt 300 ] && W=300; [ "$W" -lt 30 ] && W=30
+              log "全部冷却，等 ${W}s"; sleep "$W"
+            fi
+          done
+
+          log "5 小时内未抢到机位"; exit 3
+
+      - name: 4) 等容器就绪
+        if: steps.check.outputs.sid != '' || env.LOCATED != ''
+        run: |
+          set -uo pipefail
+          # 首次启动要 initdb，慢盘上崩溃恢复更久，给 30 分钟
+          for i in $(seq 1 90); do
+            c1=$(curl -s -o /dev/null -m 15 -w '%{http_code}' "$HEALTH/health" 2>/dev/null || echo 000)
+            [ "$c1" = "200" ] && { echo "health 200（第 $i 次）"; exit 0; }
+            b=$(curl -s -m 15 "$HEALTH/System/Info/Public" 2>/dev/null || true)
+            printf '%s' "$b" | grep -q StartupWizardCompleted && { echo "System/Info 就绪（第 $i 次）"; exit 0; }
+            [ $((i % 6)) -eq 0 ] && echo "等待中… 第 $i 次 health=$c1"
+            sleep 20
+          done
+          echo "::warning::30 分钟内未就绪，跳过建库"
+          exit 0
+
+      - name: 5) 建库
+        run: |
+          set -uo pipefail
+          JAR=/tmp/ck.txt; rm -f "$JAR"
+          TOK=""
+          login() {
+            for path in /admin/login /emby/admin/login /Users/AuthenticateByName; do
+              for body in "{\"username\":\"admin\",\"password\":\"$PW\"}" "{\"Username\":\"admin\",\"Password\":\"$PW\"}" "{\"Username\":\"admin\",\"Pw\":\"$PW\"}"; do
+                R=$(curl -s -m 30 -c "$JAR" -b "$JAR" -X POST "$HEALTH$path" \
+                      -H 'Content-Type: application/json' -d "$body" -w '\n%{http_code}')
+                CODE=$(printf '%s' "$R" | tail -n1); BODY=$(printf '%s' "$R" | sed '$d')
+                echo "  试探 $path -> $CODE"
+                if [ "$CODE" = "200" ]; then
+                  T=$(printf '%s' "$BODY" | jq -r '.token // .accessToken // .AccessToken // empty' 2>/dev/null)
+                  [ -n "$T" ] && { TOK="$T"; echo "  拿到 token"; return 0; }
+                  echo "  200（用 cookie 认证）"; return 0
+                fi
+              done
+            done
+            return 1
+          }
+          login || echo "::warning::登录试探全失败，继续用 cookie 尝试建库"
+
+          AUTH=()
+          [ -n "$TOK" ] && AUTH=(-H "X-Emby-Token: $TOK")
+
+          for path in /admin/libraries /emby/admin/libraries; do
+            L=$(curl -s -m 30 -b "$JAR" -c "$JAR" "${AUTH[@]}" "$HEALTH$path" || true)
+            echo "  列出库 $path -> $(printf '%s' "$L" | head -c 200)"
+            if printf '%s' "$L" | grep -q "$LIB_NAME"; then echo "库已存在"; break; fi
+            C=$(curl -s -m 60 -b "$JAR" -c "$JAR" "${AUTH[@]}" -X POST "$HEALTH$path" \
+                  -H 'Content-Type: application/json' \
+                  -d "{\"Name\":\"$LIB_NAME\",\"Path\":\"$LIB_PATH\"}" -w '\n%{http_code}')
+            echo "  建库 $path -> $(printf '%s' "$C" | tail -n1) $(printf '%s' "$C" | sed '$d' | head -c 200)"
+            printf '%s' "$C" | tail -n1 | grep -qE '20[014]' && break
+          done
+
+          echo "轮询扫描结果…"
+          for i in $(seq 1 30); do
+            N=$(curl -s -m 30 -b "$JAR" "${AUTH[@]}" "$HEALTH/Items?Recursive=true&Limit=1" 2>/dev/null \
+                 | jq -r '.TotalRecordCount // empty' 2>/dev/null || true)
+            echo "  第 $i 次: 条目=$N"
+            if printf '%s' "$N" | grep -qE '^[0-9]+$' && [ "$N" -gt 0 ]; then echo ">>> 库内 $N 个条目，完成"; exit 0; fi
+            sleep 20
+          done
+          echo "::warning::条目仍为 0，可能 STRM 生成中或需要手动确认路径"
